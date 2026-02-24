@@ -1,2 +1,38 @@
-streamlit pandas numpy plotly yfinance ta torch transformers gymnasium stable-baselines3 scikit-learn prophet beautifulsoup4 requests
+# Core Data Science
+numpy
+pandas
+scikit-learn
 
+# Deep Learning
+torch
+transformers
+
+# Time Series Forecasting
+prophet
+ta
+
+# Reinforcement Learning
+gymnasium
+stable-baselines3
+
+# Financial Data
+yfinance
+
+# Web & NLP
+beautifulsoup4
+requests
+
+# UI/Visualization
+streamlit
+plotly
+
+# Logging & Tracking
+mlflow
+
+# Testing
+pytest
+pytest-cov
+
+# Development
+black
+flake8
