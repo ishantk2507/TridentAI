@@ -21,6 +21,7 @@ yfinance
 # Web & NLP
 beautifulsoup4
 requests
+lxml
 
 # UI/Visualization
 streamlit

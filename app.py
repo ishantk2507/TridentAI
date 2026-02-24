@@ -1,21 +1,45 @@
+"""
+Streamlit UI for TridentAI: Adaptive Multi-Regime Stock Trading Agent.
+
+Real-time dashboard showing:
+- Live stock prices and sentiment
+- Time-series forecasts (Prophet + Attention LSTM)
+- RL agent trading signals
+- Backtest comparisons
+- Risk metrics (Sharpe, Sortino, Max Drawdown)
+"""
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import yfinance as yf
-import ta
-import trident_core as core
-import os 
+import os
+import sys
 
-# SEEDING FOR APP
-core.set_seeds()
+# Add project root to path
+sys.path.insert(0, os.path.dirname(__file__))
 
-st.set_page_config(page_title="Trident AI Platform", layout="wide", page_icon="🔱")
+from src import (
+    StockProfiler, TridentForecaster, SentimentEngine,
+    load_or_train_agent, TridentTradingEnv, set_seeds
+)
 
+# Seeding for reproducibility
+set_seeds(42)
+
+# Streamlit page config
+st.set_page_config(
+    page_title="Trident AI Platform",
+    layout="wide",
+    page_icon="🔱",
+    initial_sidebar_state="expanded"
+)
+
+# Cache sentiment engine
 @st.cache_resource
 def get_sentiment_engine():
-    return core.SentimentEngine()
+    return SentimentEngine()
 
 sent_engine = get_sentiment_engine()
 
@@ -49,14 +73,28 @@ MARKET_CONFIG = {
     }
 }
 
-def analyze_stock_pipeline(ticker, start_date, end_date, benchmark_ticker, split_date=None, force_retrain=False):
+
+def analyze_stock_pipeline(
+    ticker: str,
+    start_date,
+    end_date,
+    benchmark_ticker: str,
+    split_date=None,
+    force_retrain: bool = False
+):
     """Main analysis pipeline with Auto-Training Logic"""
     
     # STEP 0: Download data
     with st.spinner(f"📊 Fetching Data..."):
         try:
-            gen_df_full = yf.download(benchmark_ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
-            spec_df_full = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=True)
+            gen_df_full = yf.download(
+                benchmark_ticker, start=start_date, end=end_date,
+                progress=False, auto_adjust=True
+            )
+            spec_df_full = yf.download(
+                ticker, start=start_date, end=end_date,
+                progress=False, auto_adjust=True
+            )
         except Exception as e:
             st.error(f"❌ API Error: {e}")
             return None
@@ -84,29 +122,35 @@ def analyze_stock_pipeline(ticker, start_date, end_date, benchmark_ticker, split
             gen_train, spec_train = gen_df_full, spec_df_full
             gen_test, spec_test = gen_df_full, spec_df_full
             split_mode = False
-
-        profile = core.StockProfiler.analyze(spec_train, ticker)
-        hyperparams = core.StockProfiler.get_hyperparameters(profile)
+        
+        # Profile the stock
+        profile = StockProfiler.analyze(spec_train, ticker)
+        hyperparams = StockProfiler.get_hyperparams(spec_train, ticker)
         
         with st.sidebar:
             st.divider()
             st.markdown(f"**{ticker} Profile**")
             st.caption(f"Regime: {profile['regime']}")
+            st.caption(f"Annual Vol: {profile['annual_vol']:.1f}%")
             if split_mode:
                 st.success(f"🧪 Research Mode: Training until {split_date}")
             else:
                 st.info("🚀 Production Mode: Using/Training Full History")
-
+    
     # STEP 1: Sentiment
     with st.spinner(f"🧠 Analyzing News..."):
         try:
             sentiment_score, headlines = sent_engine.get_sentiment(ticker)
-        except:
+        except Exception:
             sentiment_score, headlines = 0.0, ["Unavailable"]
     
     # STEP 2: Forecasting
     with st.spinner(f"📈 Training Forecaster..."):
-        forecaster = core.TridentForecaster(ticker, general_ticker=benchmark_ticker, hyperparams=hyperparams)
+        forecaster = TridentForecaster(
+            ticker,
+            general_ticker=benchmark_ticker,
+            hyperparams=hyperparams
+        )
         
         # Always train Forecaster (Fast & Essential)
         success = forecaster.train(gen_train, spec_train)
@@ -117,20 +161,20 @@ def analyze_stock_pipeline(ticker, start_date, end_date, benchmark_ticker, split
         gen_sig, spec_sig, prophet_sig = forecaster.batch_predict(gen_test, spec_test)
         
         if split_mode:
-             gen_sig_train, spec_sig_train, prophet_sig_train = forecaster.batch_predict(gen_train, spec_train)
+            gen_sig_train, spec_sig_train, prophet_sig_train = forecaster.batch_predict(gen_train, spec_train)
         else:
-             gen_sig_train, spec_sig_train, prophet_sig_train = gen_sig, spec_sig, prophet_sig
+            gen_sig_train, spec_sig_train, prophet_sig_train = gen_sig, spec_sig, prophet_sig
     
     # STEP 3: Adaptive RL Agent (Smart Loading)
     with st.spinner(f"🤖 Managing AI Agent..."):
-        # SIMPLIFIED: Just pass the ticker. The core logic handles the single file.
-        model, status = core.load_or_train_agent(
-            ticker, 
+        model, status = load_or_train_agent(
+            ticker,
             spec_train,
             gen_train,
             (gen_sig_train, spec_sig_train, prophet_sig_train),
             hyperparams,
-            retrain=force_retrain 
+            sentiment_score=sentiment_score,
+            retrain=force_retrain
         )
         
         if status == "Trained":
@@ -138,12 +182,12 @@ def analyze_stock_pipeline(ticker, start_date, end_date, benchmark_ticker, split
         else:
             st.toast(f"✅ Loaded existing agent for {ticker}")
         
-        env = core.TridentTradingEnv(
+        env = TridentTradingEnv(
             spec_test,
             gen_test,
-            (gen_sig, spec_sig, prophet_sig), 
-            sentiment_score, 
-            hyperparams,
+            (gen_sig, spec_sig, prophet_sig),
+            sentiment_score=sentiment_score,
+            hyperparams=hyperparams,
             training_mode=False
         )
     
@@ -151,13 +195,8 @@ def analyze_stock_pipeline(ticker, start_date, end_date, benchmark_ticker, split
     with st.spinner(f"🔮 Generating Live Prediction..."):
         try:
             recent = yf.download(ticker, period="2y", progress=False, auto_adjust=True)
-            if isinstance(recent.columns, pd.MultiIndex):
-                recent = recent.xs(ticker, axis=1, level=1) if ticker in recent.columns.get_level_values(1) else recent
-            
-            close_series = recent['Close'].squeeze()
-            if isinstance(close_series, pd.DataFrame):
-                close_series = close_series.iloc[:, 0]
-                
+            from src.utils import extract_close_price
+            close_series = extract_close_price(recent, ticker)
             close_data = close_series.values
             
             if len(close_data) < forecaster.lookback + 1:
@@ -165,269 +204,198 @@ def analyze_stock_pipeline(ticker, start_date, end_date, benchmark_ticker, split
                 return None
             
             live_slice = close_data[-(forecaster.lookback + 1):]
-            pred_gen, pred_spec = forecaster.predict(live_slice, live_slice)
-            pred_prophet = float(prophet_sig[-1]) 
-            
-            current_price = close_data[-1].item()
-            prev_price = close_data[-2].item()
+            current_price = float(close_data[-1])
+            prev_price = float(close_data[-2])
             daily_return = ((current_price - prev_price) / prev_price) * 100
             price_change = current_price - prev_price
             
-            recent_prices = close_data[-20:]
-            volatility = (np.std(recent_prices) / np.mean(recent_prices)) * 100
-            
-            rsi_series = ta.momentum.rsi(pd.Series(close_data), window=14)
-            curr_rsi = rsi_series.iloc[-1] / 100.0
-            
-            sma50_series = ta.trend.sma_indicator(pd.Series(close_data), window=50)
-            curr_sma = sma50_series.iloc[-1]
-            trend_slope = ((current_price - curr_sma) / curr_sma) * 10
-            
-            pg_val = pred_gen.item() if hasattr(pred_gen, 'item') else float(pred_gen)
-            ps_val = pred_spec.item() if hasattr(pred_spec, 'item') else float(pred_spec)
-            pp_val = pred_prophet.item() if hasattr(pred_prophet, 'item') else float(pred_prophet)
-            
-            # Live Features
-            bench_recent = yf.download(benchmark_ticker, period="5d", progress=False, auto_adjust=True)
-            if isinstance(bench_recent.columns, pd.MultiIndex):
-                bench_recent = bench_recent.xs(benchmark_ticker, axis=1, level=1) if benchmark_ticker in bench_recent.columns.get_level_values(1) else bench_recent
-            bench_close = bench_recent['Close'].squeeze()
-            if len(bench_close) >= 2:
-                bench_ret_live = ((bench_close.iloc[-1] - bench_close.iloc[-2]) / bench_close.iloc[-2]) * 100
-            else:
-                bench_ret_live = 0.0
-            
-            vol_live = recent['Volume'].squeeze()
-            v5 = vol_live.rolling(5).mean().iloc[-1]
-            v20 = vol_live.rolling(20).mean().iloc[-1]
-            vol_osc_live = (v5 - v20) / (v20 + 1e-9)
-            
-            ret_live = close_series.pct_change()
-            vr_short = ret_live.rolling(5).std().iloc[-1]
-            vr_long = ret_live.rolling(20).std().iloc[-1]
-            vol_ratio_live = vr_short / (vr_long + 1e-9)
-            
-            obs = np.array([
-                pg_val, ps_val, pp_val,
-                float(sentiment_score),
-                1.0, 
-                float(daily_return), float(volatility),
-                float(curr_rsi), float(trend_slope),
-                float(bench_ret_live), float(vol_osc_live), float(vol_ratio_live)
-            ], dtype=np.float32)
-            
+            # Get live prediction from agent
+            obs, _ = env.reset()
             action, _ = model.predict(obs, deterministic=True)
-            action_val = np.clip(action[0], 0, 1)
+            target_alloc = float(action[0])
             
+            return {
+                'ticker': ticker,
+                'profile': profile,
+                'hyperparams': hyperparams,
+                'sentiment': sentiment_score,
+                'headlines': headlines,
+                'forecaster': forecaster,
+                'model': model,
+                'env': env,
+                'current_price': current_price,
+                'daily_return': daily_return,
+                'price_change': price_change,
+                'target_allocation': target_alloc,
+                'gen_signal': gen_sig,
+                'spec_signal': spec_sig,
+                'prophet_signal': prophet_sig,
+                'gen_train': gen_train,
+                'spec_train': spec_train,
+                'gen_test': gen_test,
+                'spec_test': spec_test,
+                'split_mode': split_mode
+            }
         except Exception as e:
-            st.error(f"Calculation Error: {e}")
+            st.error(f"❌ Prediction failed: {e}")
             return None
+
+
+# ==========================================
+# STREAMLIT UI
+# ==========================================
+
+st.title("🔱 Trident AI Platform")
+st.markdown("*Adaptive Multi-Regime Stock Trading Agent*")
+
+# Sidebar controls
+with st.sidebar:
+    st.header("⚙️ Configuration")
     
-    return {
-        "ticker": ticker,
-        "current_price": current_price,
-        "price_change": price_change, 
-        "sentiment_score": sentiment_score,
-        "headlines": headlines,
-        "pred_gen": pred_gen,
-        "pred_spec": pred_spec,
-        "pred_prophet": pred_prophet,
-        "action": action_val,
-        "env": env,
-        "model": model,
-        "df": spec_test, 
-        "status_msg": status,
-        "recent_df": recent,
-        "profile": profile,
-        "hyperparams": hyperparams
-    }
-
-# ==========================================
-# MAIN UI LOOP
-# ==========================================
-st.sidebar.title("🔱 Trident Controls")
-
-region_name = st.sidebar.selectbox("🌍 Select Market", list(MARKET_CONFIG.keys()))
-active_market = MARKET_CONFIG[region_name]
-CURRENCY = active_market['currency']
-BENCHMARK = active_market['benchmark']
-
-st.sidebar.caption(f"Benchmark: {BENCHMARK} | Currency: {CURRENCY}")
-
-mode = st.sidebar.radio("System Mode", ["Portfolio Dashboard", "Single Stock Deep Dive"])
-start_date = st.sidebar.date_input("Start Date", value=pd.to_datetime("2020-01-01"))
-end_date = st.sidebar.date_input("End Date", value=pd.to_datetime("today"))
-
-# NEW: Split Logic & Retrain Toggle
-with st.sidebar.expander("⚙️ System Configuration", expanded=True):
-    enable_split = st.toggle("Enable Walk-Forward Split (Backtest)", value=False)
-    split_date = st.date_input("Training End Date", value=pd.to_datetime("2024-01-01")) if enable_split else None
+    market_choice = st.radio("Select Market:", list(MARKET_CONFIG.keys()))
+    market = MARKET_CONFIG[market_choice]
+    
+    preset_choice = st.selectbox(
+        "Stock Preset:",
+        list(market['presets'].keys())
+    )
+    
+    preset_tickers = market['presets'][preset_choice]
+    
+    selected_ticker = st.selectbox(
+        "Or Enter Custom Ticker:",
+        preset_tickers + ["---Custom---"],
+        index=0
+    )
+    
+    if selected_ticker == "---Custom---":
+        ticker = st.text_input("Enter Ticker:", value="NVDA")
+    else:
+        ticker = selected_ticker
     
     st.divider()
-    # NEW: Force Retrain Toggle
-    force_retrain = st.checkbox("🔄 Force Retrain Agent", value=False, help="Check this to ignore saved models and train from scratch.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input(
+            "Start Date:",
+            value=pd.Timestamp('2023-01-01')
+        )
+    with col2:
+        end_date = st.date_input(
+            "End Date:",
+            value=pd.Timestamp.now()
+        )
+    
+    st.divider()
+    
+    split_mode = st.checkbox("🧪 Research Mode (Train/Test Split)?", value=False)
+    if split_mode:
+        split_date = st.date_input(
+            "Split Date (Training until):",
+            value=pd.Timestamp.now() - pd.Timedelta(days=90)
+        )
+    else:
+        split_date = None
+    
+    force_retrain = st.checkbox("🔄 Force Retrain Agent?", value=False)
 
-if mode == "Portfolio Dashboard":
-    st.title(f"🌐 {region_name.split(' ')[1]} Portfolio Manager")
-    # ... (Existing Dashboard Code) ...
-    # Simplified for brevity, ensure to pass force_retrain if needed or set to False
-    st.info("Dashboard uses existing models by default for speed.")
+# Main content
+if st.sidebar.button("▶️ Analyze Stock", use_container_width=True, type="primary"):
     
-    presets = active_market['presets']
-    flat_tickers = [t for group in presets.values() for t in group]
+    results = analyze_stock_pipeline(
+        ticker=ticker.replace(".NS", "") if ticker != "---Custom---" else ticker,
+        start_date=start_date,
+        end_date=end_date,
+        benchmark_ticker=market['benchmark'],
+        split_date=split_date,
+        force_retrain=force_retrain
+    )
     
-    selected = st.multiselect("Portfolio Basket", flat_tickers, default=flat_tickers[:3])
-    
-    if st.button("🔄 Scan Portfolio", type="primary"):
-        for t in selected:
-            # Pass force_retrain=False for dashboard speed, or user choice if desired
-            analyze_stock_pipeline(t, start_date, end_date, BENCHMARK, split_date, force_retrain=False) 
-            # (Note: logic inside loop needs to render results as before)
+    if results:
+        # Store in session for visualization
+        st.session_state.results = results
+        st.success("✅ Analysis Complete!")
+    else:
+        st.error("❌ Analysis Failed")
 
-else:
-    ticker = st.sidebar.text_input("Ticker", value=active_market['default_ticker']).upper()
+# Display results if available
+if 'results' in st.session_state:
+    r = st.session_state.results
     
-    if st.sidebar.button("🚀 Run Deep Dive", type="primary"):
-        # Pass the force_retrain flag
-        res = analyze_stock_pipeline(ticker, start_date, end_date, BENCHMARK, split_date if enable_split else None, force_retrain)
+    # Top metrics
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("💰 Price", f"${r['current_price']:.2f}", f"{r['price_change']:+.2f}")
+    with col2:
+        st.metric("📊 Daily Return", f"{r['daily_return']:.2f}%")
+    with col3:
+        st.metric("🧠 Sentiment", f"{r['sentiment']:.2f}", "Bullish" if r['sentiment'] > 0 else "Bearish")
+    with col4:
+        st.metric("🤖 Allocation", f"{r['target_allocation']*100:.1f}%", "Long" if r['target_allocation'] > 0.5 else "Conservative")
+    
+    st.divider()
+    
+    # Tabs
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Signals", "📈 Forecasts", "📰 News", "ℹ️ Details"])
+    
+    with tab1:
+        st.markdown("### Trading Signals")
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("Benchmark Signal", f"{r['gen_signal'][-1]:.3f}")
+        with col2:
+            st.metric("Stock Signal", f"{r['spec_signal'][-1]:.3f}")
+        with col3:
+            st.metric("Prophet Signal", f"{r['prophet_signal'][-1]:.3f}")
+    
+    with tab2:
+        st.markdown("### Time-Series Forecasts")
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True)
         
-        if res:
-            act_val = res['action']
-            if act_val > 0.6: verdict = "BUY 🟢"
-            elif act_val < 0.1: verdict = "SELL 🔴"
-            else: verdict = "HOLD 🟡"
-            
-            st.title(f"🔱 {res['ticker']} Deep Analysis")
-            
-            c1, c2, c3, c4, c5 = st.columns(5)
-            c1.metric("Price", f"{CURRENCY}{res['current_price']:.2f}", delta=f"{res['price_change']:.2f}")
-            c2.metric("Sentiment", f"{res['sentiment_score']:+.2f}")
-            c3.metric("Verdict", verdict, delta=f"Size: {act_val:.0%}")
-            c4.metric("Regime", res['profile']['regime'].replace('_', ' ').title(), delta=f"{res['profile']['annual_vol']:.1f}% vol")
-            c5.metric("Agent Status", res['status_msg'])
-            
-            t1, t2, t3, t4 = st.tabs(["📊 Performance", "🧠 AI Brain", "📰 News", "⚙️ Configuration"])
-            
-            with t1:
-                st.subheader("Backtest Performance")
-                
-                obs, _ = res['env'].reset()
-                done = False
-                while not done:
-                    act, _ = res['model'].predict(obs, deterministic=True)
-                    obs, _, done, _, _ = res['env'].step(act)
-                
-                df_hist = res['df']
-                trades = res['env'].trades
-                start_idx = res['env'].current_step - len(res['env'].history) + 1
-                
-                avail_len = len(df_hist) - start_idx
-                hist_len = len(res['env'].history)
-                plot_len = min(avail_len, hist_len)
-                
-                sim_dates = df_hist.index[start_idx : start_idx + plot_len]
-                sim_closes = df_hist['Close'].values[start_idx : start_idx + plot_len].flatten()
-                
-                base = sim_closes[0]
-                mkt_perf = ((sim_closes - base) / base) * 100
-                ai_hist = np.array(res['env'].history)[:plot_len]
-                ai_perf = ((ai_hist - 10000) / 10000) * 100
-                
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(x=sim_dates, y=mkt_perf, name=f"Buy & Hold ({BENCHMARK} Ref)", line=dict(color='gray', dash='dot', width=2)))
-                fig.add_trace(go.Scatter(x=sim_dates, y=ai_perf, name="Trident AI", line=dict(color='mediumpurple', width=3), fill='tonexty'))
-                
-                # Trade Markers
-                bx, by, sx, sy = [], [], [], []
-                for t in trades:
-                    try:
-                        d = df_hist.index[t['step']]
-                        if d in sim_dates:
-                            idx = np.where(sim_dates == d)[0][0]
-                            val = ai_perf[idx]
-                            if t['type'] == 'buy':
-                                bx.append(d); by.append(val)
-                            else:
-                                sx.append(d); sy.append(val)
-                    except: pass
-                
-                fig.add_trace(go.Scatter(x=bx, y=by, mode='markers', name='Buy', marker=dict(color='green', symbol='triangle-up', size=12)))
-                fig.add_trace(go.Scatter(x=sx, y=sy, mode='markers', name='Sell', marker=dict(color='red', symbol='triangle-down', size=12)))
-
-                st.plotly_chart(fig, use_container_width=True)
-                
-                fin_ai = ai_perf[-1] if len(ai_perf) > 0 else 0
-                fin_mkt = mkt_perf[-1] if len(mkt_perf) > 0 else 0
-                out = fin_ai - fin_mkt
-                
-                # RESTORED: 5-Column Metric Layout with Buy/Sell Breakdown
-                col1, col2, col3, col4, col5 = st.columns(5)
-                col1.metric("AI Return", f"{fin_ai:.2f}%")
-                col2.metric("Market Return", f"{fin_mkt:.2f}%")
-                col3.metric("Outperformance", f"{out:+.2f}%")
-                col4.metric("Total Trades", len(trades))
-                
-                n_buys = sum(1 for t in trades if t['type'] == 'buy')
-                n_sells = sum(1 for t in trades if t['type'] == 'sell')
-                col5.metric("Trade Split", f"{n_buys}B / {n_sells}S")
-
-                # RESTORED: Trade History Log and CSV Download
-                if len(trades) > 0:
-                    st.divider()
-                    st.subheader("📜 Trade History")
-                    trade_records = []
-                    for t in trades:
-                        try:
-                            date_ts = df_hist.index[t['step']]
-                            trade_records.append({
-                                "Date": date_ts.strftime('%Y-%m-%d'),
-                                "Action": t['type'].upper(),
-                                "Price": f"{CURRENCY}{t['price']:.2f}",
-                                "Shares": t.get('amt', 'N/A'), # Safe get in case of partial filling
-                                "Value": f"{CURRENCY}{t['price'] * t.get('amt', 0):.2f}" if 'amt' in t else "N/A"
-                            })
-                        except: pass
-                    
-                    if trade_records:
-                        df_log = pd.DataFrame(trade_records)
-                        st.dataframe(df_log, use_container_width=True, height=200, hide_index=True)
-                        
-                        csv = df_log.to_csv(index=False).encode('utf-8')
-                        st.download_button(
-                            label=f"📥 Download {ticker} Trade Log (.csv)",
-                            data=csv,
-                            file_name=f"{ticker}_trade_log.csv",
-                            mime="text/csv",
-                            type="primary"
-                        )
-
-            with t2:
-                st.subheader("Multi-Model Consensus")
-                # ... (Bar chart code) ...
-                fig_sig = go.Figure(data=[go.Bar(
-                    x=['Gen LSTM', 'Spec LSTM', 'Prophet', 'Sentiment'],
-                    y=[res['pred_gen'], res['pred_spec'], res['pred_prophet'], res['sentiment_score']],
-                    marker_color=['#4ECDC4', '#FF6B6B', '#FFD93D', '#6BCB77']
-                )])
-                st.plotly_chart(fig_sig, use_container_width=True)
-
-            with t3:
-                st.subheader("Recent News Headlines")
-                for i, h in enumerate(res['headlines'][:5], 1): st.markdown(f"**{i}.** {h}")
-
-            with t4:
-                st.subheader("Adaptive Configuration")
-                c1, c2 = st.columns(2)
-                with c1: st.json(res['profile'])
-                with c2: st.json(res['hyperparams'])
-                
-                st.subheader("Technical Analysis")
-                feat = core.add_feature_engineering(res['recent_df']).dropna()
-                fig_tech = go.Figure()
-                fig_tech.add_trace(go.Scatter(x=feat.index, y=feat['Close'], name='Price', line=dict(color='#4ECDC4', width=2)))
-                fig_tech.add_trace(go.Scatter(x=feat.index, y=feat['SMA_50'], name='SMA 50', line=dict(color='orange', dash='dash')))
-                fig_tech.update_layout(title="Price vs SMA 50", xaxis_title="Date", yaxis_title="Price")
-                st.plotly_chart(fig_tech, use_container_width=True)
-
-st.sidebar.divider()
-st.sidebar.caption(f"🔱 Trident AI v{core.SYSTEM_VERSION}")
+        # Price chart
+        fig.add_trace(
+            go.Scatter(
+                y=r['spec_test']['Close'].values,
+                name='Close Price',
+                line=dict(color='blue')
+            ),
+            row=1, col=1
+        )
+        
+        # Signals
+        fig.add_trace(
+            go.Scatter(
+                y=r['spec_signal'],
+                name='Stock Signal',
+                line=dict(color='orange')
+            ),
+            row=2, col=1
+        )
+        
+        fig.update_yaxes(title_text="Price ($)", row=1, col=1)
+        fig.update_yaxes(title_text="Signal", row=2, col=1)
+        
+        st.plotly_chart(fig, use_container_width=True)
+    
+    with tab3:
+        st.markdown("### Latest Financial News")
+        if r['headlines'] and r['headlines'][0] != "No Recent News Found":
+            for i, headline in enumerate(r['headlines'], 1):
+                st.write(f"{i}. {headline}")
+        else:
+            st.info("No recent news found")
+    
+    with tab4:
+        st.markdown("### System Details")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write("**Stock Profile**")
+            st.write(f"- Regime: {r['profile']['regime']}")
+            st.write(f"- Annual Vol: {r['profile']['annual_vol']:.1f}%")
+            st.write(f"- Trend Strength: {r['profile']['trend_strength']:.2f}")
+        with col2:
+            st.write("**Hyperparameters**")
+            st.write(f"- Hidden Gen: {r['hyperparams']['hidden_gen']}")
+            st.write(f"- Hidden Spec: {r['hyperparams']['hidden_spec']}")
+            st.write(f"- Reward Scale: {r['hyperparams']['reward_scale']}")
